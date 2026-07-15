@@ -207,7 +207,6 @@ fn register_recording_session_end_hook(
     });
 }
 
-
 /// Returns the canonical CUA-owned state directory path.
 ///
 /// This is the only directory that `run_serve` will harden to 0o700.
@@ -237,10 +236,14 @@ fn cua_state_dir() -> std::path::PathBuf {
 #[cfg(unix)]
 fn set_owner_only(path: &std::path::Path, mode: u32) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
-        .map_err(|e| anyhow::anyhow!(
-            "SEC-05: failed to set mode {:#o} on {}: {}", mode, path.display(), e
-        ))
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).map_err(|e| {
+        anyhow::anyhow!(
+            "SEC-05: failed to set mode {:#o} on {}: {}",
+            mode,
+            path.display(),
+            e
+        )
+    })
 }
 
 // ── Paths ─────────────────────────────────────────────────────────────────────
@@ -718,21 +721,18 @@ pub async fn run_serve(
     // Remove stale socket file (from a crashed previous daemon).
     let _ = std::fs::remove_file(socket_path);
 
-    let listener = UnixListener::bind(socket_path)
-        .map_err(|e| anyhow::anyhow!("bind {socket_path}: {e}"))?;
+    let listener =
+        UnixListener::bind(socket_path).map_err(|e| anyhow::anyhow!("bind {socket_path}: {e}"))?;
 
     // SEC-05: fail closed if socket mode cannot be set.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = std::fs::set_permissions(
-            socket_path,
-            std::fs::Permissions::from_mode(0o700),
-        ) {
+        if let Err(e) =
+            std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o700))
+        {
             let _ = std::fs::remove_file(socket_path);
-            anyhow::bail!(
-                "SEC-05: cannot set socket {socket_path} to 0700: {e}"
-            );
+            anyhow::bail!("SEC-05: cannot set socket {socket_path} to 0700: {e}");
         }
     }
 
@@ -751,15 +751,12 @@ pub async fn run_serve(
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            if let Err(e) = std::fs::set_permissions(
-                pid_path,
-                std::fs::Permissions::from_mode(0o600),
-            ) {
+            if let Err(e) =
+                std::fs::set_permissions(pid_path, std::fs::Permissions::from_mode(0o600))
+            {
                 let _ = std::fs::remove_file(socket_path);
                 let _ = std::fs::remove_file(pid_path);
-                anyhow::bail!(
-                    "SEC-05: cannot set PID file {pid_path} to 0600: {e}"
-                );
+                anyhow::bail!("SEC-05: cannot set PID file {pid_path} to 0600: {e}");
             }
         }
     }
@@ -1894,7 +1891,6 @@ mod session_boundary_tests {
     }
 }
 
-
 // ── SEC-05: Unix permission and cleanup tests ─────────────────────────────────
 
 #[cfg(test)]
@@ -1908,14 +1904,14 @@ mod sec05_permission_tests {
         Arc::new(cua_driver_core::tool::ToolRegistry::new())
     }
 
-    async fn wait_for_socket(path: &str) {
+    async fn wait_for_path(path: &std::path::Path, label: &str) {
         for _ in 0..100 {
-            if std::path::Path::new(path).exists() {
+            if path.exists() {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        panic!("socket {path} did not appear within 2s");
+        panic!("{label} {} did not appear within 2s", path.display());
     }
 
     async fn shutdown_daemon(socket: &str) {
@@ -1946,10 +1942,13 @@ mod sec05_permission_tests {
         let tmp = tempfile::tempdir().unwrap();
         let custom_dir = tmp.path().join("custom-cua");
         std::fs::create_dir_all(&custom_dir).unwrap();
-        std::fs::set_permissions(&custom_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&custom_dir, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
 
-        let socket_path = custom_dir.join("test.sock").to_string_lossy().to_string();
-        let pid_path = custom_dir.join("test.pid").to_string_lossy().to_string();
+        let socket_file = custom_dir.join("test.sock");
+        let pid_file = custom_dir.join("test.pid");
+        let socket_path = socket_file.to_string_lossy().to_string();
+        let pid_path = pid_file.to_string_lossy().to_string();
 
         let reg = test_registry();
         let socket_for_server = socket_path.clone();
@@ -1957,10 +1956,16 @@ mod sec05_permission_tests {
         let reg_for_server = reg.clone();
 
         let server = tokio::spawn(async move {
-            let _ = run_serve(reg_for_server, &socket_for_server, pid_for_server.as_deref()).await;
+            let _ = run_serve(
+                reg_for_server,
+                &socket_for_server,
+                pid_for_server.as_deref(),
+            )
+            .await;
         });
 
-        wait_for_socket(&socket_path).await;
+        wait_for_path(&socket_file, "socket").await;
+        wait_for_path(&pid_file, "PID file").await;
 
         let dir_meta = std::fs::metadata(&custom_dir).unwrap();
         assert_eq!(
@@ -1996,7 +2001,11 @@ mod sec05_permission_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pid_write_failure_removes_socket_and_errors() {
         let tmp = tempfile::tempdir().unwrap();
-        let socket_path = tmp.path().join("fail-test.sock").to_string_lossy().to_string();
+        let socket_path = tmp
+            .path()
+            .join("fail-test.sock")
+            .to_string_lossy()
+            .to_string();
 
         let pid_dir = tmp.path().join("pid-is-dir");
         std::fs::create_dir(&pid_dir).unwrap();
