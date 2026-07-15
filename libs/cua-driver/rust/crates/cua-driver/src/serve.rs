@@ -666,9 +666,16 @@ pub async fn run_serve(
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
 
-    // Create parent directory.
+    // Create parent directory with owner-only permissions.
+    // SEC-05: durable boundary — the directory persists across restarts so a
+    // one-time chmod after bind is not sufficient.
     if let Some(dir) = std::path::Path::new(socket_path).parent() {
         std::fs::create_dir_all(dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
     }
 
     // Remove stale socket file (from a crashed previous daemon).
@@ -676,6 +683,13 @@ pub async fn run_serve(
 
     let listener = UnixListener::bind(socket_path)
         .map_err(|e| anyhow::anyhow!("bind {socket_path}: {e}"))?;
+
+    // SEC-05: set socket to owner-only permissions after bind.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o700));
+    }
 
     eprintln!("Cua Driver daemon listening on {socket_path}");
 
@@ -685,6 +699,12 @@ pub async fn run_serve(
             let _ = std::fs::create_dir_all(dir);
         }
         let _ = std::fs::write(pid_path, std::process::id().to_string());
+        // SEC-05: set PID file to owner-only read/write.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(pid_path, std::fs::Permissions::from_mode(0o600));
+        }
     }
 
     // Shutdown channel.
