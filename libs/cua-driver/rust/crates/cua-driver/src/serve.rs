@@ -207,6 +207,43 @@ fn register_recording_session_end_hook(
     });
 }
 
+
+/// Returns the canonical CUA-owned state directory path.
+///
+/// This is the only directory that `run_serve` will harden to 0o700.
+/// Custom socket/PID paths under user-specified directories are left at
+/// their parent's existing permissions.
+fn cua_state_dir() -> std::path::PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        std::path::PathBuf::from(home).join("Library/Caches/cua-driver")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        std::path::PathBuf::from(home).join(".cache/cua-driver")
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        std::path::PathBuf::from("/tmp/cua-driver")
+    }
+}
+
+/// SEC-05: apply owner-only mode to a file, returning an error on failure.
+///
+/// Unlike the previous `let _ =` pattern, this fails closed so the caller
+/// can remove the insecure artifact before serving.
+#[cfg(unix)]
+fn set_owner_only(path: &std::path::Path, mode: u32) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .map_err(|e| anyhow::anyhow!(
+            "SEC-05: failed to set mode {:#o} on {}: {}", mode, path.display(), e
+        ))
+}
+
+// ── Paths ─────────────────────────────────────────────────────────────────────
 // ── Paths ─────────────────────────────────────────────────────────────────────
 
 /// Returns the platform default socket/pipe path.
@@ -667,8 +704,16 @@ pub async fn run_serve(
     use tokio::net::UnixListener;
 
     // Create parent directory.
-    if let Some(dir) = std::path::Path::new(socket_path).parent() {
+    // SEC-05: only harden the CUA-owned default state directory.  Custom
+    // socket paths under /tmp or other shared directories must not be chmod'd.
+    let socket_dir = std::path::Path::new(socket_path).parent();
+    let state_dir = cua_state_dir();
+    if let Some(dir) = socket_dir {
         std::fs::create_dir_all(dir)?;
+        #[cfg(unix)]
+        if dir == state_dir {
+            set_owner_only(dir, 0o700)?;
+        }
     }
 
     // Remove stale socket file (from a crashed previous daemon).
@@ -677,6 +722,21 @@ pub async fn run_serve(
     let listener = UnixListener::bind(socket_path)
         .map_err(|e| anyhow::anyhow!("bind {socket_path}: {e}"))?;
 
+    // SEC-05: fail closed if socket mode cannot be set.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(
+            socket_path,
+            std::fs::Permissions::from_mode(0o700),
+        ) {
+            let _ = std::fs::remove_file(socket_path);
+            anyhow::bail!(
+                "SEC-05: cannot set socket {socket_path} to 0700: {e}"
+            );
+        }
+    }
+
     eprintln!("Cua Driver daemon listening on {socket_path}");
 
     // Write PID file.
@@ -684,7 +744,25 @@ pub async fn run_serve(
         if let Some(dir) = std::path::Path::new(pid_path).parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let _ = std::fs::write(pid_path, std::process::id().to_string());
+        if let Err(e) = std::fs::write(pid_path, std::process::id().to_string()) {
+            let _ = std::fs::remove_file(socket_path);
+            anyhow::bail!("SEC-05: cannot write PID file {pid_path}: {e}");
+        }
+        // SEC-05: fail closed if PID file mode cannot be set.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) = std::fs::set_permissions(
+                pid_path,
+                std::fs::Permissions::from_mode(0o600),
+            ) {
+                let _ = std::fs::remove_file(socket_path);
+                let _ = std::fs::remove_file(pid_path);
+                anyhow::bail!(
+                    "SEC-05: cannot set PID file {pid_path} to 0600: {e}"
+                );
+            }
+        }
     }
 
     // Shutdown channel.
