@@ -244,7 +244,6 @@ fn set_owner_only(path: &std::path::Path, mode: u32) -> anyhow::Result<()> {
 }
 
 // ── Paths ─────────────────────────────────────────────────────────────────────
-// ── Paths ─────────────────────────────────────────────────────────────────────
 
 /// Returns the platform default socket/pipe path.
 pub fn default_socket_path() -> String {
@@ -1892,5 +1891,130 @@ mod session_boundary_tests {
         let eff = apply_session_identity(&mut args, &Some("mcp-999".to_owned()));
         assert_eq!(args["_session_id"], "caller-set");
         assert_eq!(eff.as_deref(), Some("caller-set"));
+    }
+}
+
+
+// ── SEC-05: Unix permission and cleanup tests ─────────────────────────────────
+
+#[cfg(test)]
+#[cfg(unix)]
+mod sec05_permission_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
+
+    fn test_registry() -> Arc<cua_driver_core::tool::ToolRegistry> {
+        Arc::new(cua_driver_core::tool::ToolRegistry::new())
+    }
+
+    async fn wait_for_socket(path: &str) {
+        for _ in 0..100 {
+            if std::path::Path::new(path).exists() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("socket {path} did not appear within 2s");
+    }
+
+    async fn shutdown_daemon(socket: &str) {
+        let req = DaemonRequest {
+            method: "shutdown".into(),
+            name: None,
+            args: None,
+            session_id: None,
+            observation_origin: None,
+        };
+        let socket = socket.to_owned();
+        let _ = tokio::task::spawn_blocking(move || send_request(&socket, &req)).await;
+    }
+
+    #[test]
+    fn default_socket_parent_is_cua_state_dir() {
+        let socket = default_socket_path();
+        let socket_parent = std::path::Path::new(&socket).parent().unwrap();
+        assert_eq!(
+            socket_parent,
+            cua_state_dir().as_path(),
+            "default_socket_path parent must equal cua_state_dir()"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn custom_parent_dir_preserved_socket_and_pid_modes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let custom_dir = tmp.path().join("custom-cua");
+        std::fs::create_dir_all(&custom_dir).unwrap();
+        std::fs::set_permissions(&custom_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let socket_path = custom_dir.join("test.sock").to_string_lossy().to_string();
+        let pid_path = custom_dir.join("test.pid").to_string_lossy().to_string();
+
+        let reg = test_registry();
+        let socket_for_server = socket_path.clone();
+        let pid_for_server = Some(pid_path.clone());
+        let reg_for_server = reg.clone();
+
+        let server = tokio::spawn(async move {
+            let _ = run_serve(reg_for_server, &socket_for_server, pid_for_server.as_deref()).await;
+        });
+
+        wait_for_socket(&socket_path).await;
+
+        let dir_meta = std::fs::metadata(&custom_dir).unwrap();
+        assert_eq!(
+            dir_meta.permissions().mode() & 0o777,
+            0o755,
+            "custom parent directory mode must not be hardened"
+        );
+
+        let sock_meta = std::fs::metadata(&socket_path).unwrap();
+        assert_eq!(
+            sock_meta.permissions().mode() & 0o777,
+            0o700,
+            "socket must be 0700"
+        );
+
+        let pid_meta = std::fs::metadata(&pid_path).unwrap();
+        assert_eq!(
+            pid_meta.permissions().mode() & 0o777,
+            0o600,
+            "PID file must be 0600"
+        );
+
+        let pid_contents = std::fs::read_to_string(&pid_path).unwrap();
+        assert!(
+            pid_contents.trim().parse::<u32>().is_ok(),
+            "PID file must contain a numeric PID"
+        );
+
+        shutdown_daemon(&socket_path).await;
+        let _ = server.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pid_write_failure_removes_socket_and_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket_path = tmp.path().join("fail-test.sock").to_string_lossy().to_string();
+
+        let pid_dir = tmp.path().join("pid-is-dir");
+        std::fs::create_dir(&pid_dir).unwrap();
+        let pid_path = pid_dir.to_string_lossy().to_string();
+
+        let reg = test_registry();
+        let result = run_serve(reg, &socket_path, Some(&pid_path)).await;
+
+        assert!(result.is_err(), "run_serve must fail when PID write fails");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("SEC-05") && err.contains("PID"),
+            "error must mention SEC-05 and PID; got: {err}"
+        );
+
+        assert!(
+            !std::path::Path::new(&socket_path).exists(),
+            "socket must be removed after PID write failure"
+        );
     }
 }
